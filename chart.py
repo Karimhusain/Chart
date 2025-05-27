@@ -2,97 +2,99 @@ import dash
 from dash import dcc, html
 from dash.dependencies import Output, Input
 import plotly.graph_objects as go
-import requests
-import pandas as pd
 import asyncio
 import threading
 import websockets
 import json
+import pandas as pd
+from collections import deque
 from datetime import datetime
 
-# Global state
-candles_df = pd.DataFrame()
+# Data global
+candles = deque(maxlen=30)
 orderbook_data = {"bids": [], "asks": []}
 
-# Ambil data historis BTCUSDT 1H dari awal 2025 (hanya 200 candle terakhir)
-def fetch_limited_candles():
-    url = "https://api.binance.com/api/v3/klines"
-    start_time = int(datetime(2025, 1, 1).timestamp() * 1000)
-    r = requests.get(url, params={
-        "symbol": "BTCUSDT",
-        "interval": "1h",
-        "startTime": start_time,
-        "limit": 1000
-    })
-    data = r.json()
-    df = pd.DataFrame(data, columns=[
-        "time", "open", "high", "low", "close", "volume",
-        "_", "_", "_", "_", "_", "_"
-    ])
-    df["time"] = pd.to_datetime(df["time"], unit='ms')
-    df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
-    return df.tail(200)  # Ambil 200 candle terakhir
+# WebSocket candlestick 1 menit
+async def listen_candles():
+    uri = "wss://stream.binance.com:9443/ws/btcusdt@kline_1m"
+    async with websockets.connect(uri) as websocket:
+        while True:
+            msg = await websocket.recv()
+            data = json.loads(msg)
+            k = data["k"]
+            candles.append({
+                "time": datetime.fromtimestamp(k["t"] / 1000),
+                "open": float(k["o"]),
+                "high": float(k["h"]),
+                "low": float(k["l"]),
+                "close": float(k["c"]),
+            })
 
 # WebSocket orderbook
 async def listen_orderbook():
     uri = "wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms"
     async with websockets.connect(uri) as websocket:
         while True:
-            data = await websocket.recv()
-            parsed = json.loads(data)
-            orderbook_data["bids"] = [(float(p), float(v)) for p, v in parsed.get("bids", [])]
-            orderbook_data["asks"] = [(float(p), float(v)) for p, v in parsed.get("asks", [])]
+            msg = await websocket.recv()
+            data = json.loads(msg)
+            orderbook_data["bids"] = [(float(p), float(v)) for p, v in data.get("bids", [])]
+            orderbook_data["asks"] = [(float(p), float(v)) for p, v in data.get("asks", [])]
 
+# Jalankan WebSocket di thread terpisah
 def start_ws():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(listen_orderbook())
+    loop.create_task(listen_candles())
+    loop.create_task(listen_orderbook())
+    loop.run_forever()
 
-threading.Thread(target=start_ws, daemon=True).start()
+t = threading.Thread(target=start_ws)
+t.daemon = True
+t.start()
 
 # Dash App
 app = dash.Dash(__name__)
-candles_df = fetch_limited_candles()
-
-app.layout = html.Div(style={"backgroundColor": "#121212", "color": "white"}, children=[
-    html.H4("BTC/USDT - 1H Chart (2025) + Horizontal Orderbook", style={"textAlign": "center"}),
+app.layout = html.Div([
+    html.H3("BTC/USDT Realtime Chart + Orderbook Horizontal"),
     dcc.Graph(id="chart"),
-    dcc.Interval(id="interval", interval=3000, n_intervals=0)
+    dcc.Interval(id="update", interval=2000, n_intervals=0)
 ])
 
-@app.callback(Output("chart", "figure"), Input("interval", "n_intervals"))
+@app.callback(Output("chart", "figure"), Input("update", "n_intervals"))
 def update_chart(n):
-    df = candles_df
     fig = go.Figure()
 
-    # Candlestick
-    fig.add_trace(go.Candlestick(
-        x=df["time"], open=df["open"], high=df["high"],
-        low=df["low"], close=df["close"],
-        increasing_line_color="lime", decreasing_line_color="red"
-    ))
+    if candles:
+        df = pd.DataFrame(candles)
+        fig.add_trace(go.Candlestick(
+            x=df["time"],
+            open=df["open"],
+            high=df["high"],
+            low=df["low"],
+            close=df["close"],
+            name="Candlestick"
+        ))
 
-    # Tentukan batas horizontal orderbook di ujung kanan chart
-    last_time = df["time"].iloc[-1]
-    right_edge = last_time + pd.Timedelta(hours=4)
+        # Tambahkan garis horizontal orderbook putih
+        for price, _ in orderbook_data["bids"] + orderbook_data["asks"]:
+            fig.add_shape(
+                type="line",
+                x0=df["time"].iloc[0],
+                x1=df["time"].iloc[-1],
+                y0=price,
+                y1=price,
+                line=dict(color="white", width=1),
+                xref='x',
+                yref='y'
+            )
 
-    for price, volume in orderbook_data["bids"] + orderbook_data["asks"]:
-        fig.add_shape(
-            type="line",
-            x0=right_edge, x1=right_edge + pd.Timedelta(minutes=30),
-            y0=price, y1=price,
-            line=dict(color="orange", width=min(volume * 2, 8)),
-            xref="x", yref="y"
+        fig.update_layout(
+            xaxis_title="Time",
+            yaxis_title="Price",
+            height=600,
+            template="plotly_dark",
+            xaxis_rangeslider_visible=False
         )
-
-    fig.update_layout(
-        template="plotly_dark",
-        height=600,
-        xaxis_rangeslider_visible=False,
-        margin=dict(l=20, r=40, t=30, b=30),
-        xaxis=dict(title="Time"),
-        yaxis=dict(title="Price"),
-    )
 
     return fig
 
