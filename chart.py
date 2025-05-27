@@ -1,166 +1,115 @@
 import dash
 from dash import dcc, html
-from dash.dependencies import Input, Output, State
+from dash.dependencies import Output, Input
 import plotly.graph_objects as go
+import requests
+import pandas as pd
 import asyncio
 import threading
 import websockets
 import json
-import pandas as pd
 from datetime import datetime
+from collections import deque
 
-app = dash.Dash(__name__)
+# Global
+candles_df = pd.DataFrame()
+orderbook_data = {"bids": [], "asks": []}
 
-# Global data storage
-candles = []
-orderbook = {"bids": [], "asks": []}
-last_candle_time = None
-streaming = True
+# Ambil data historis 1 jam dari awal 2025
+def fetch_historical_candles():
+    url = "https://api.binance.com/api/v3/klines"
+    start_time = int(datetime(2025, 1, 1).timestamp() * 1000)
+    end_time = int(datetime.now().timestamp() * 1000)
+    klines = []
+    while start_time < end_time:
+        params = {
+            "symbol": "BTCUSDT",
+            "interval": "1h",
+            "startTime": start_time,
+            "limit": 1000
+        }
+        r = requests.get(url, params=params)
+        data = r.json()
+        if not data:
+            break
+        klines += data
+        start_time = data[-1][0] + 1
 
-# WebSocket untuk candlestick 1m
-async def ws_candles():
-    global candles, last_candle_time
-    uri = "wss://stream.binance.com:9443/ws/btcusdt@kline_1m"
-    async with websockets.connect(uri) as ws:
-        while True:
-            data = await ws.recv()
-            obj = json.loads(data)
-            k = obj['k']
-            t = datetime.fromtimestamp(k['t'] / 1000)
-            if last_candle_time != t:
-                candle = {
-                    "time": t,
-                    "open": float(k['o']),
-                    "high": float(k['h']),
-                    "low": float(k['l']),
-                    "close": float(k['c']),
-                }
-                candles.append(candle)
-                if len(candles) > 200:
-                    candles.pop(0)
-                last_candle_time = t
+    df = pd.DataFrame(klines, columns=[
+        "time", "open", "high", "low", "close", "volume", "_", "_", "_", "_", "_", "_"
+    ])
+    df["time"] = pd.to_datetime(df["time"], unit='ms')
+    df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
+    return df
 
-# WebSocket untuk orderbook depth
-async def ws_orderbook():
-    global orderbook
+# WebSocket orderbook realtime
+async def listen_orderbook():
     uri = "wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms"
-    async with websockets.connect(uri) as ws:
+    async with websockets.connect(uri) as websocket:
         while True:
-            data = await ws.recv()
-            obj = json.loads(data)
-            orderbook["bids"] = [(float(p), float(v)) for p, v in obj.get("bids", [])]
-            orderbook["asks"] = [(float(p), float(v)) for p, v in obj.get("asks", [])]
+            data = await websocket.recv()
+            parsed = json.loads(data)
+            orderbook_data["bids"] = [(float(p), float(v)) for p, v in parsed.get("bids", [])]
+            orderbook_data["asks"] = [(float(p), float(v)) for p, v in parsed.get("asks", [])]
 
-# Jalankan WebSocket di thread background
+# Jalankan websocket orderbook
 def start_ws():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.create_task(ws_candles())
-    loop.create_task(ws_orderbook())
-    loop.run_forever()
+    loop.run_until_complete(listen_orderbook())
 
-t = threading.Thread(target=start_ws)
-t.daemon = True
-t.start()
+ws_thread = threading.Thread(target=start_ws)
+ws_thread.daemon = True
+ws_thread.start()
 
-# Layout Dash
-app.layout = html.Div([
-    html.H2("BTC/USDT Realtime Candlestick + Orderbook Horizontal"),
-    dcc.Dropdown(
-        id='timeframe',
-        options=[
-            {'label': '1 Minute', 'value': '1m'},
-            {'label': '5 Minutes', 'value': '5m'},
-            {'label': '15 Minutes', 'value': '15m'},
-            {'label': '1 Hour', 'value': '1h'},
-        ],
-        value='1m',
-        clearable=False,
-        style={'width': '200px'}
-    ),
-    html.Button("Pause", id='pause-btn', n_clicks=0),
-    dcc.Loading(dcc.Graph(id='chart'), type='circle'),
-    dcc.Interval(id='interval', interval=3000, n_intervals=0),
-    html.Div(id='status', style={'marginTop': 10})
+# Inisialisasi Dash
+app = dash.Dash(__name__)
+candles_df = fetch_historical_candles()
+
+app.layout = html.Div(style={"backgroundColor": "#121212", "color": "white"}, children=[
+    html.H3("BTC/USDT Chart 1H from 2025 with Orderbook Lines", style={"textAlign": "center"}),
+    dcc.Graph(id="chart"),
+    dcc.Interval(id="interval", interval=3000, n_intervals=0)
 ])
 
-@app.callback(
-    Output('chart', 'figure'),
-    Output('status', 'children'),
-    Input('interval', 'n_intervals'),
-    Input('timeframe', 'value'),
-    Input('pause-btn', 'n_clicks'),
-    State('pause-btn', 'children')
-)
-def update_chart(n, timeframe, n_clicks, pause_text):
-    global streaming
-    # Toggle pause/resume
-    if n_clicks % 2 == 1:
-        streaming = False
-    else:
-        streaming = True
+@app.callback(Output("chart", "figure"), Input("interval", "n_intervals"))
+def update_chart(n):
+    fig = go.Figure()
 
-    if not streaming:
-        return dash.no_update, "Streaming paused."
+    # Candlestick chart
+    fig.add_trace(go.Candlestick(
+        x=candles_df["time"],
+        open=candles_df["open"],
+        high=candles_df["high"],
+        low=candles_df["low"],
+        close=candles_df["close"],
+        name="BTCUSDT",
+        increasing_line_color='green',
+        decreasing_line_color='red'
+    ))
 
-    df = pd.DataFrame(candles)
-    if df.empty:
-        return go.Figure(), "Loading data..."
-
-    # Resample candles sesuai timeframe
-    if timeframe != '1m':
-        df['time'] = pd.to_datetime(df['time'])
-        df.set_index('time', inplace=True)
-        rule = timeframe.replace('m', 'T').replace('h', 'H')
-        df = df.resample(rule).agg({
-            'open': 'first',
-            'high': 'max',
-            'low': 'min',
-            'close': 'last'
-        }).dropna().reset_index()
-
-    fig = go.Figure(data=[go.Candlestick(
-        x=df['time'],
-        open=df['open'],
-        high=df['high'],
-        low=df['low'],
-        close=df['close'],
-        name="BTC/USDT"
-    )])
-
-    # Orderbook: garis horizontal full x axis dengan ketebalan sesuai volume
-    max_vol = max([v for p, v in orderbook['bids'] + orderbook['asks']] or [1])
-    x0 = df['time'].iloc[0]
-    x1 = df['time'].iloc[-1]
-
-    for price, vol in orderbook['bids'] + orderbook['asks']:
-        width = 1 + (vol / max_vol) * 8  # ketebalan max 9 px
+    # Tambah orderbook horizontal garis
+    for price, volume in orderbook_data["bids"] + orderbook_data["asks"]:
         fig.add_shape(
             type="line",
-            x0=x0,
-            x1=x1,
+            x0=candles_df["time"].iloc[0],
+            x1=candles_df["time"].iloc[-1],
             y0=price,
             y1=price,
-            line=dict(color="purple", width=width),
-            xref='x',
-            yref='y'
+            line=dict(color="purple", width=min(volume * 2, 10)),
+            xref="x",
+            yref="y"
         )
 
     fig.update_layout(
-        height=700,
-        margin=dict(l=40, r=40, t=40, b=40),
-        xaxis=dict(title='Time', rangeslider=dict(visible=True), autorange=True),
-        yaxis=dict(title='Price (USDT)', autorange=True),
-        hovermode='closest',
+        template="plotly_dark",
+        height=600,
+        xaxis_rangeslider_visible=False,
+        margin=dict(l=40, r=20, t=30, b=30),
+        xaxis=dict(title="Time", type="date"),
+        yaxis=dict(title="Price")
     )
-    return fig, "Streaming live data..."
-
-@app.callback(
-    Output('pause-btn', 'children'),
-    Input('pause-btn', 'n_clicks'),
-)
-def toggle_pause_text(n):
-    return "Resume" if n % 2 == 1 else "Pause"
+    return fig
 
 if __name__ == "__main__":
-    app.run(debug=False, host='0.0.0.0', port=8050)
+    app.run(debug=True, host="0.0.0.0", port=8050)
